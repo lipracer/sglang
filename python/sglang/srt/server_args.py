@@ -24,6 +24,8 @@ import tempfile
 from typing import List, Literal, Optional, Union
 
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.layers.afd_type import AFDPerspective, parse_afd_micro_batch
+
 from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -402,6 +404,10 @@ class ServerArgs:
     enable_flashinfer_trtllm_moe: bool = False
     enable_triton_kernel_moe: bool = False
     enable_flashinfer_mxfp4_moe: bool = False
+
+    # For AF disaggregation
+    afd_perspective: Optional[AFDPerspective] = None
+    afd_mirco_batch: int = 3
 
     def __post_init__(self):
         # Check deprecated arguments
@@ -2218,6 +2224,28 @@ class ServerArgs:
             "--enable-flashinfer-mxfp4-moe",
             action="store_true",
             help="(Deprecated) Enable FlashInfer MXFP4 MoE backend for modelopt_fp4 quant on Blackwell.",
+        )
+
+        #For AF disaggregation
+        parser.add_argument(
+            "--afd-perspective",
+            type=AFDPerspective,
+            choices=list(AFDPerspective),
+            default=ServerArgs.afd_perspective,
+            help=(
+                "Set the AF disaggregation perspective. "
+                f"(choices: %(choices)s, default: {ServerArgs.afd_perspective})"
+            )
+        )
+        parser.add_argument(
+            "--afd-mirco-batch",
+            type=parse_afd_micro_batch,
+            default=ServerArgs.afd_mirco_batch,
+            help=(
+                "Set the micro batch size for AF disaggregation. "
+                f"Must be an integer >= 3. "
+                f"(default: {ServerArgs.afd_mirco_batch,})"
+            )
         )
 
     @classmethod

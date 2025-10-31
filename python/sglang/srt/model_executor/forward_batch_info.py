@@ -309,6 +309,14 @@ class ForwardBatch:
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
+    # For afd overlap
+    afd_split_seq_index: Optional[List[int]] = None    #len = m-1
+    afd_parent_token_range: Optional[Tuple[int, int]] = None
+    afd_children: Optional[List[ForwardBatch]] = None
+
+    # For AF disaggregation
+    can_run_afd_overlap: bool = None
+
     @classmethod
     def init_new(
         cls,
@@ -316,6 +324,7 @@ class ForwardBatch:
         model_runner: ModelRunner,
     ):
         from sglang.srt.two_batch_overlap import TboForwardBatchPreparer
+        from sglang.srt.two_batch_overlap import AfdForwardBatchPreparer
 
         ret = cls(
             forward_mode=batch.forward_mode,
@@ -455,6 +464,10 @@ class ForwardBatch:
         # Init lora information
         if model_runner.server_args.enable_lora:
             model_runner.lora_manager.prepare_lora_batch(ret)
+
+        ret.afd_split_seq_index = ret.tbo_split_seq_index
+        AfdForwardBatchPreparer.prepare(ret)
+        ret.tbo_split_seq_index = None
 
         TboForwardBatchPreparer.prepare(
             ret, is_draft_worker=model_runner.is_draft_worker

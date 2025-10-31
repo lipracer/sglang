@@ -1,3 +1,85 @@
+# How to run AFD
+
+> Note: This is only a primitive demo for now, with lots of workarounds and perhaps some bugs. We will keep working on it.
+
+2 choices are provided:
+
+* AFD with ZMQ: Easy to deploy. Poor performance.
+* AFD with StepMesh: Better performance.
+
+## Quick Start: Run with ZMQ
+
+Download this branch and install it.
+([Install SGLang](https://docs.sglang.ai/get_started/install.html))
+
+Example:
+
+Attn
+```bash
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+# Address of ffn scheduler, necessary for inter-node AFD, default is 127.0.0.1
+export AFD_SCHED_HOST=<ffn_ip>
+
+# 2 new options for AFD
+# --afd-perspective <attn/ffn>
+# --afd-mirco-batch <1/2/3>: Micro batch number for overlap, only 1,2,3 are supported now.
+python -m sglang.launch_server --model-path <Qwen3-moe model> --disable-overlap-schedule --disable-cuda-graph --afd-perspective attn --afd-mirco-batch 3
+```
+
+FFN
+```bash
+export CUDA_VISIBLE_DEVICES=4,5,6,7
+export AFD_SCHED_HOST=<ffn_ip>
+
+python -m sglang.launch_server --model-path <Qwen3-moe model> --disable-overlap-schedule --disable-cuda-graph --port <port> --skip-server-warmup --watchdog-timeout 3600 --afd-perspective ffn --afd-mirco-batch 3
+```
+
+Note:
+* Some un-supported features should be disabled explicitly, such as cudagraph, overlap schedule.
+* Some ports are hardcoded in AFD implementation including `4000x`, `5000x`, and `65300`. Please avoid using them again.
+
+## Run with StepMesh
+
+Setup StepMesh besides SGLang.
+([StepMesh README](https://github.com/stepfun-ai/StepMesh?tab=readme-ov-file#build))
+
+Example:
+
+Attn
+```bash
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export AFD_SCHED_HOST=<ffn_ip>
+
+# RDMA NIC such as "bond0", this will enable StepMesh
+export MLC_INTERFACE=<nic_name>
+# StepMesh root ip, should be same with attn and ffn
+export DMLC_PS_ROOT_URI=<root_ip>
+# Node number of ffn
+export DMLC_NUM_SERVER=1
+# Node number of attn
+export DMLC_NUM_WORKER=1
+# GPU number
+export DMLC_GROUP_SIZE=1
+
+python -m sglang.launch_server --model-path <Qwen3-moe model> --disable-overlap-schedule --disable-cuda-graph --afd-perspective attn --afd-mirco-batch 3
+```
+
+FFN
+```bash
+export CUDA_VISIBLE_DEVICES=4,5,6,7
+export AFD_SCHED_HOST=<ffn_ip>
+
+export MLC_INTERFACE=<nic_name>
+export DMLC_PS_ROOT_URI=<root_ip>
+export DMLC_NUM_SERVER=1
+export DMLC_NUM_WORKER=1
+export DMLC_GROUP_SIZE=1
+
+python -m sglang.launch_server --model-path <Qwen3-moe model> --disable-overlap-schedule --disable-cuda-graph --port <port> --skip-server-warmup --watchdog-timeout 3600 --afd-perspective ffn --afd-mirco-batch 3
+```
+
+---
+
 <div align="center" id="sglangtop">
 <img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400" margin="10px"></img>
 

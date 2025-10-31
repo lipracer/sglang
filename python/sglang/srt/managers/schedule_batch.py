@@ -108,6 +108,8 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "quantization",
     "enable_custom_logit_processor",
     "disaggregation_mode",
+    "afd_perspective",
+    "afd_mirco_batch",
 ]
 
 # Put some global args for easy access
@@ -689,6 +691,11 @@ class Req:
         return all_ids[self.surr_offset :], self.read_offset - self.surr_offset
 
     def check_finished(self):
+        from sglang.srt.layers.afd import afd_is_ffn
+        if afd_is_ffn():
+            # always skip for ffn
+            return
+
         if self.finished():
             return
 
@@ -1700,6 +1707,32 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_seq_lens = self.extend_lens
             extend_prefix_lens = self.prefix_lens
             extend_logprob_start_lens = self.extend_logprob_start_lens
+
+        if self.forward_mode.is_decode_or_idle():
+            attention_backend_str = global_server_args_dict["decode_attention_backend"]
+        else:
+            attention_backend_str = global_server_args_dict["prefill_attention_backend"]
+        # Create seq_lens_cpu when needed
+        from sglang.srt.layers.afd import get_afd_perspective
+        if (
+            attention_backend_str == "fa3"
+            or (
+                global_server_args_dict["use_mla_backend"]
+                and attention_backend_str == "flashinfer"
+            )
+            or attention_backend_str == "flashmla"
+            or attention_backend_str == "cutlass_mla"
+            or attention_backend_str == "ascend"
+            or global_server_args_dict["enable_two_batch_overlap"]
+            or get_afd_perspective() is not None
+        ):
+            seq_lens_cpu = (
+                seq_lens_cpu_cache
+                if seq_lens_cpu_cache is not None
+                else self.seq_lens.cpu()
+            )
+        else:
+            seq_lens_cpu = None
 
         if self.sampling_info:
             if self.has_grammar:

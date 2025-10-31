@@ -55,7 +55,7 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
-from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+from sglang.srt.layers.attention.tbo_backend import TboAttnBackend, AfdAttnBackend
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     get_attention_tp_size,
@@ -134,6 +134,8 @@ from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
     FlattenedTensorMetadata,
 )
+
+from sglang.srt.layers.afd import get_afd_perspective, get_afd_mirco_batch, afd_is_ffn
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -1538,6 +1540,9 @@ class ModelRunner:
         """Init attention kernel backend."""
         if self.server_args.enable_two_batch_overlap and not self.is_draft_worker:
             self.attn_backend = TboAttnBackend.init_new(self._get_attention_backend)
+        elif get_afd_perspective() is not None:
+            m = get_afd_mirco_batch()
+            self.attn_backend = AfdAttnBackend.init_new(self._get_attention_backend, m = m)
         else:
             self.attn_backend = self._get_attention_backend()
 

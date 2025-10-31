@@ -185,6 +185,33 @@ class TboAttnBackend(AttentionBackend):
     def forward_decode(self, *args, **kwargs):
         return self.primary.forward_decode(*args, **kwargs)
 
+class AfdAttnBackend(AttentionBackend):
+    def __init__(self, primary: AttentionBackend, children: List[AttentionBackend]):
+        super().__init__()
+        self.primary = primary
+        self.children = children
+
+    @classmethod
+    def init_new(cls, creator: Callable[[], AttentionBackend], m = 2):
+        return cls(
+            primary=creator(),
+            children=[creator() for _ in range(m)],
+        )
+
+    def init_forward_metadata(self, forward_batch: "ForwardBatch"):
+        self.primary.init_forward_metadata(forward_batch=forward_batch)
+        if forward_batch.afd_children is not None:
+            for child, forward_batch_child in zip(
+                self.children, forward_batch.afd_children, strict=True
+            ):
+                if forward_batch_child.batch_size > 0:
+                    child.init_forward_metadata(forward_batch=forward_batch_child)
+
+    def forward_extend(self, *args, **kwargs):
+        return self.primary.forward_extend(*args, **kwargs)
+
+    def forward_decode(self, *args, **kwargs):
+        return self.primary.forward_decode(*args, **kwargs)
 
 def _init_forward_metadata_cuda_graph_split(
     fn_name: str,

@@ -67,6 +67,8 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
 
+from sglang.srt.layers.afd import model_forward_afd
+
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
@@ -510,7 +512,16 @@ class Qwen2MoeModel(nn.Module):
             residual = pp_proxy_tensors["residual"]
 
         aux_hidden_states = []
-        if forward_batch.can_run_tbo:
+        if forward_batch.can_run_afd_overlap:
+            hidden_states, residual = model_forward_afd(
+                layers=self.layers,
+                positions=positions,
+                forward_batch=forward_batch,
+                hidden_states=hidden_states,
+                residual=residual,
+                input_data_scatter_mode=ScatterMode.model_input_output(),
+            )
+        elif forward_batch.can_run_tbo:
             hidden_states, residual = model_forward_maybe_tbo(
                 layers=self.layers,
                 enable_tbo=True,
