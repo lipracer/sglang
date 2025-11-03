@@ -171,7 +171,6 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
-
 from sglang.srt.layers.afd import get_afd_mirco_batch, afd_is_attn, afd_is_ffn, get_afd_perspective
 
 logger = logging.getLogger(__name__)
@@ -1131,7 +1130,6 @@ class Scheduler(
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_rpc)
-
                 if afd_is_ffn():
                     while True:
                         try:
@@ -1216,7 +1214,6 @@ class Scheduler(
     def process_input_requests(self, recv_reqs: List):
         self.afd_batchsize_attn = None
         self.afd_forward_mode = None
-
         for recv_req in recv_reqs:
             # If it is a health check generation request and there are running requests, ignore it.
             if is_health_check_generate_req(recv_req) and (
@@ -1225,16 +1222,6 @@ class Scheduler(
                 or len(self.offload_tags) > 0
             ):
                 self.return_health_check_ct += 1
-                continue
-
-            # If it is a MultiTokenizerWrapper, unwrap it and handle the inner request.
-            if isinstance(recv_req, MultiTokenizerWrapper):
-                worker_id = recv_req.worker_id
-                recv_req = recv_req.obj
-                output = self._request_dispatcher(recv_req)
-                if output is not None:
-                    output = MultiTokenizerWrapper(worker_id, output)
-                    self.send_to_tokenizer.send_pyobj(output)
                 continue
 
             # If it is a work request, accept or reject the request based on the request queue size.
@@ -1262,6 +1249,16 @@ class Scheduler(
 
                 # ffn recv afd_req, return immediately to run batch
                 return
+
+            # If it is a MultiTokenizerWrapper, unwrap it and handle the inner request.
+            if isinstance(recv_req, MultiTokenizerWrapper):
+                worker_id = recv_req.worker_id
+                recv_req = recv_req.obj
+                output = self._request_dispatcher(recv_req)
+                if output is not None:
+                    output = MultiTokenizerWrapper(worker_id, output)
+                    self.send_to_tokenizer.send_pyobj(output)
+                continue
 
             output = self._request_dispatcher(recv_req)
             if output is not None:

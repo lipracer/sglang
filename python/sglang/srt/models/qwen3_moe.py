@@ -60,16 +60,12 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP as Qwen3MoeMLP
 from sglang.srt.models.qwen2_moe import Qwen2MoeModel
-
 from sglang.srt.utils import (
     add_prefix,
     is_cuda,
     is_flashinfer_available,
     is_non_idle_and_non_empty,
 )
-
-from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
-from sglang.srt.utils import DeepEPMode, add_prefix, is_cuda, is_non_idle_and_non_empty
 from sglang.srt.layers.afd_type import AFDPerspective
 from sglang.srt.layers.afd import (
     AFDCommunicator, AFDProxyAttention, AFDProxyMLP,
@@ -467,27 +463,9 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
         rms_norm_eps = config.rms_norm_eps
         attention_bias = config.attention_bias
-
         dual_chunk_attention_config = getattr(
             config, "dual_chunk_attention_config", None
         )
-        self.self_attn = Qwen3MoeAttention(
-            hidden_size=self.hidden_size,
-            num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
-            layer_id=layer_id,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
-            max_position_embeddings=max_position_embeddings,
-            head_dim=head_dim,
-            rms_norm_eps=rms_norm_eps,
-            attention_bias=attention_bias,
-            quant_config=quant_config,
-            prefix=add_prefix("self_attn", prefix),
-            dual_chunk_attention_config=dual_chunk_attention_config,
-            alt_stream=alt_stream,
-        )
-
 
         afd_perspective = get_afd_perspective()
 
@@ -507,6 +485,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 attention_bias=attention_bias,
                 quant_config=quant_config,
                 prefix=add_prefix("self_attn", prefix),
+                dual_chunk_attention_config=dual_chunk_attention_config,
                 alt_stream=alt_stream,
             )
 
@@ -852,14 +831,6 @@ class Qwen3MoeForCausalLM(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
 
-
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
-        )
-
         afd_perspective = get_afd_perspective()
 
         if afd_perspective == AFDPerspective.AFD_PERSPECTIVE_FFN:
@@ -877,7 +848,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         if afd_perspective == AFDPerspective.AFD_PERSPECTIVE_ATTN:
             expert_params_mapping = []
         else:
-            expert_params_mapping = get_moe_impl_class().make_expert_params_mapping(
+            expert_params_mapping = FusedMoE.make_expert_params_mapping(
                 ckpt_gate_proj_name="gate_proj",
                 ckpt_down_proj_name="down_proj",
                 ckpt_up_proj_name="up_proj",

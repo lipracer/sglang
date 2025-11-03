@@ -1708,32 +1708,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_prefix_lens = self.prefix_lens
             extend_logprob_start_lens = self.extend_logprob_start_lens
 
-        if self.forward_mode.is_decode_or_idle():
-            attention_backend_str = global_server_args_dict["decode_attention_backend"]
-        else:
-            attention_backend_str = global_server_args_dict["prefill_attention_backend"]
-        # Create seq_lens_cpu when needed
-        from sglang.srt.layers.afd import get_afd_perspective
-        if (
-            attention_backend_str == "fa3"
-            or (
-                global_server_args_dict["use_mla_backend"]
-                and attention_backend_str == "flashinfer"
-            )
-            or attention_backend_str == "flashmla"
-            or attention_backend_str == "cutlass_mla"
-            or attention_backend_str == "ascend"
-            or global_server_args_dict["enable_two_batch_overlap"]
-            or get_afd_perspective() is not None
-        ):
-            seq_lens_cpu = (
-                seq_lens_cpu_cache
-                if seq_lens_cpu_cache is not None
-                else self.seq_lens.cpu()
-            )
-        else:
-            seq_lens_cpu = None
-
         if self.sampling_info:
             if self.has_grammar:
                 self.sampling_info.grammars = [req.grammar for req in self.reqs]

@@ -1132,8 +1132,7 @@ class AfdForwardBatchPreparer:
             else:
                 raise NotImplementedError
         else:
-            raise NotImplementedError
-
+            raise NotImplementedError 
 
 # -------------------------------- Execution ---------------------------------------
 

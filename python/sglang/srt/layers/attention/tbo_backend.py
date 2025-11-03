@@ -213,6 +213,7 @@ class AfdAttnBackend(AttentionBackend):
     def forward_decode(self, *args, **kwargs):
         return self.primary.forward_decode(*args, **kwargs)
 
+
 def _init_forward_metadata_cuda_graph_split(
     fn_name: str,
     seq_slice: slice,
