@@ -735,6 +735,11 @@ class EmbeddingReqInput:
             rid=self.rid[i],
         )
 
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+@dataclass
+class AFDReqInput:
+    batch_size: int
+    forward_mode: ForwardMode
 
 @dataclass
 class TokenizedEmbeddingReqInput:

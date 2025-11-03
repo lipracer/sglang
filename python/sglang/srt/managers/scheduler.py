@@ -25,7 +25,7 @@ from concurrent import futures
 from dataclasses import dataclass
 from http import HTTPStatus
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, Sequence
 
 import psutil
 import setproctitle
@@ -104,10 +104,12 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
+    AFDReqInput,
 )
 from sglang.srt.managers.mm_utils import init_embedding_cache
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
+    FINISH_LENGTH,
     MultimodalInputs,
     Req,
     ScheduleBatch,
@@ -155,6 +157,7 @@ from sglang.srt.utils import (
     freeze_gc,
     get_available_gpu_memory,
     get_bool_env_var,
+    get_int_env_var,
     get_zmq_socket,
     is_cpu,
     kill_itself_when_parent_died,
@@ -168,6 +171,7 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+from sglang.srt.layers.afd import get_afd_mirco_batch, afd_is_attn, afd_is_ffn, get_afd_perspective
 
 logger = logging.getLogger(__name__)
 
@@ -524,6 +528,21 @@ class Scheduler(
         if get_bool_env_var("SGLANG_GC_LOG"):
             configure_gc_logger()
 
+        self.send_to_ffn, self.recv_from_attn = None, None
+        if self.pp_rank == 0 and self.attn_tp_rank == 0:
+            # AFD-NOTE: require better init
+            host = os.getenv("AFD_SCHED_HOST", "127.0.0.1")
+            port = get_int_env_var("AFD_SCHED_PORT", 65300)
+            afd_ipc_name = f"tcp://{host}:{port}"
+            if afd_is_attn():
+                self.send_to_ffn = get_zmq_socket(
+                    context, zmq.PUSH, afd_ipc_name, False
+                )
+            elif afd_is_ffn():
+                self.recv_from_attn = get_zmq_socket(
+                    context, zmq.PULL, afd_ipc_name, True
+                )
+
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
             [
@@ -824,6 +843,91 @@ class Scheduler(
             self.last_batch = batch
 
     @DynamicGradMode()
+    def event_loop_afd(self):
+        """A normal scheduler loop for AFD."""
+        def prepare_overlap(batch: ScheduleBatch):
+            '''
+            AFD-NOTE: for now just use tbo_split_seq_index to pass afd info
+            '''
+            batch.tbo_split_seq_index = None
+            m = get_afd_mirco_batch()
+            if batch.batch_size() < m:
+                return
+
+            forward_mode = batch.forward_mode
+
+            def _split_array_by_sum_m(arr: Sequence[int], m) -> int:
+                if m == 2:
+                    overall_sum = sum(arr)
+                    left_sum = 0
+                    min_diff = float("inf")
+                    best_index = 0
+
+                    for i in range(1, len(arr)):
+                        left_sum += arr[i - 1]
+                        right_sum = overall_sum - left_sum
+                        diff = abs(left_sum - right_sum)
+                        if diff <= min_diff:
+                            min_diff = diff
+                            best_index = i
+                        else:
+                            break
+
+                    return [best_index]
+                elif m == 3:
+                    # AFD-NOTE: now we use seq num balance (#token can be unbalanced)
+                    interval = len(arr) // m
+                    return [interval, interval * 2]
+
+            if forward_mode == ForwardMode.EXTEND:
+                num_tokens = batch.extend_num_tokens
+                extend_lens = batch.extend_lens
+                batch.tbo_split_seq_index = _split_array_by_sum_m(extend_lens, m)
+            elif forward_mode.is_decode():
+                token_num_per_seq = 1
+                num_tokens = batch.batch_size() * token_num_per_seq
+
+                total_b = (num_tokens // token_num_per_seq)
+                tbo_split_seq_index = total_b // m
+
+                if m == 2:
+                    batch.tbo_split_seq_index = [tbo_split_seq_index, ]
+                elif m == 3:
+                    batch.tbo_split_seq_index = [tbo_split_seq_index, 2 * tbo_split_seq_index]
+            else:
+                raise NotImplementedError()
+
+        logger.info("event_loop_afd: role={} m={}".format(get_afd_perspective(), get_afd_mirco_batch()))
+        while True:
+            # AFD-NOTE: skip warmup batch of ffn, as it will be done by attn warmup
+            # AFD TODO: attn forward non-work-request to ffn
+            recv_reqs = self.recv_requests()
+            self.process_input_requests(recv_reqs)
+            if afd_is_ffn() and self.afd_batchsize_attn is None:
+                continue
+
+            batch = self.get_next_batch_to_run()
+            self.cur_batch = batch
+
+            if batch:
+                if afd_is_attn() and self.pp_rank == 0 and self.attn_tp_rank == 0:
+                    afd_req = AFDReqInput(
+                        batch.batch_size(),
+                        batch.forward_mode
+                    )
+                    self.send_to_ffn.send_pyobj(afd_req)
+
+                prepare_overlap(batch)
+                result = self.run_batch(batch)
+                self.process_batch_result(batch, result)
+
+            else:
+                # When the server is idle, do self-check and re-init some states
+                self.self_check_during_idle()
+
+            self.last_batch = batch
+
+    @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.result_queue = deque()
@@ -1026,6 +1130,13 @@ class Scheduler(
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_rpc)
+                if afd_is_ffn():
+                    while True:
+                        try:
+                            recv_afd = self.recv_from_attn.recv_pyobj(zmq.NOBLOCK)
+                        except zmq.ZMQError:
+                            break
+                        recv_reqs.append(recv_afd)
             else:
                 recv_reqs = None
         else:
@@ -1101,6 +1212,8 @@ class Scheduler(
         return recv_reqs
 
     def process_input_requests(self, recv_reqs: List):
+        self.afd_batchsize_attn = None
+        self.afd_forward_mode = None
         for recv_req in recv_reqs:
             # If it is a health check generation request and there are running requests, ignore it.
             if is_health_check_generate_req(recv_req) and (
@@ -1124,6 +1237,18 @@ class Scheduler(
                     )
                     self.send_to_tokenizer.send_pyobj(abort_req)
                     continue
+
+                if afd_is_attn() and self.attn_tp_rank == 0:
+                    # forward work req to ffn
+                    self.send_to_ffn.send_pyobj(recv_req)
+
+            if is_afd_request(recv_req):
+                assert afd_is_ffn()
+                self.afd_batchsize_attn = recv_req.batch_size
+                self.afd_forward_mode = recv_req.forward_mode
+
+                # ffn recv afd_req, return immediately to run batch
+                return
 
             # If it is a MultiTokenizerWrapper, unwrap it and handle the inner request.
             if isinstance(recv_req, MultiTokenizerWrapper):
@@ -1585,6 +1710,14 @@ class Scheduler(
         else:
             # Run decode
             if not self.running_batch.is_empty():
+                if afd_is_ffn():
+                    # forcibly finish some reqs to align with attn
+                    batch = self.running_batch
+
+                    assert batch.batch_size() >= self.afd_batchsize_attn, "{} < {}".format(batch.batch_size(), self.afd_batchsize_attn)
+                    for i in range(batch.batch_size() - self.afd_batchsize_attn):
+                        batch.reqs[i].finished_reason = FINISH_LENGTH(0)
+
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
@@ -2538,6 +2671,8 @@ def is_work_request(recv_req):
         ),
     )
 
+def is_afd_request(recv_req):
+    return isinstance(recv_req, AFDReqInput)
 
 def run_scheduler_process(
     server_args: ServerArgs,
@@ -2608,6 +2743,8 @@ def run_scheduler_process(
                 scheduler.event_loop_pp()
             elif scheduler.enable_overlap:
                 scheduler.event_loop_overlap()
+            elif afd_is_ffn() or afd_is_attn():
+                scheduler.event_loop_afd()
             else:
                 scheduler.event_loop_normal()
         elif disaggregation_mode == DisaggregationMode.PREFILL:

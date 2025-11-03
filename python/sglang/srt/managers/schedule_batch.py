@@ -108,6 +108,8 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "quantization",
     "enable_custom_logit_processor",
     "disaggregation_mode",
+    "afd_perspective",
+    "afd_mirco_batch",
 ]
 
 # Put some global args for easy access
@@ -689,6 +691,11 @@ class Req:
         return all_ids[self.surr_offset :], self.read_offset - self.surr_offset
 
     def check_finished(self):
+        from sglang.srt.layers.afd import afd_is_ffn
+        if afd_is_ffn():
+            # always skip for ffn
+            return
+
         if self.finished():
             return
 
