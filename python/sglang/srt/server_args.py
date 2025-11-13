@@ -23,6 +23,7 @@ import sys
 import tempfile
 from typing import List, Literal, Optional, Union
 
+from sglang.srt.layers.afd_type import AFDPerspective, parse_afd_micro_batch
 from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.reasoning_parser import ReasoningParser
@@ -268,6 +269,10 @@ class ServerArgs:
     # For PD-Multiplexing
     enable_pdmux: bool = False
     sm_group_num: int = 3
+
+    # For AF disaggregation
+    afd_perspective: Optional[AFDPerspective] = None
+    afd_mirco_batch: int = 3
 
     def __post_init__(self):
         # Expert parallelism
@@ -1809,6 +1814,28 @@ class ServerArgs:
             "--weight-loader-disable-mmap",
             action="store_true",
             help="Disable mmap while loading weight using safetensors.",
+        )
+
+        #For AF disaggregation
+        parser.add_argument(
+            "--afd-perspective",
+            type=AFDPerspective,
+            choices=list(AFDPerspective),
+            default=ServerArgs.afd_perspective,
+            help=(
+                "Set the AF disaggregation perspective. "
+                f"(choices: %(choices)s, default: {ServerArgs.afd_perspective})"
+            )
+        )
+        parser.add_argument(
+            "--afd-mirco-batch",
+            type=parse_afd_micro_batch,
+            default=ServerArgs.afd_mirco_batch,
+            help=(
+                "Set the micro batch size for AF disaggregation. "
+                f"Must be an integer >= 3. "
+                f"(default: {ServerArgs.afd_mirco_batch,})"
+            )
         )
 
     @classmethod

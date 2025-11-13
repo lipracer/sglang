@@ -73,6 +73,11 @@ from sglang.srt.models.qwen2_moe import Qwen2MoeMLP as Qwen3MoeMLP
 from sglang.srt.models.qwen2_moe import Qwen2MoeModel
 from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.utils import DeepEPMode, add_prefix, is_cuda, is_non_idle_and_non_empty
+from sglang.srt.layers.afd_type import AFDPerspective
+from sglang.srt.layers.afd import (
+    AFDCommunicator, AFDProxyAttention, AFDProxyMLP,
+    get_afd_perspective,
+)
 
 Qwen3MoeConfig = None
 
@@ -148,6 +153,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch] = None
     ) -> torch.Tensor:
 
+        logger.warning(f"=============0 Qwen3MoeSparseMoeBlock forward : {get_attention_tp_rank()}, {hidden_states}")
         if not global_server_args_dict["enable_deepep_moe"]:
             return self.forward_normal(hidden_states)
         else:
@@ -161,6 +167,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         ]
 
     def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        logger.warning(f"=============0 Qwen3MoeSparseMoeBlock forward_norm : {get_attention_tp_rank()}, {hidden_states}")
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
@@ -459,21 +466,27 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
         rms_norm_eps = config.rms_norm_eps
         attention_bias = config.attention_bias
-        self.self_attn = Qwen3MoeAttention(
-            hidden_size=self.hidden_size,
-            num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
-            layer_id=layer_id,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
-            max_position_embeddings=max_position_embeddings,
-            head_dim=head_dim,
-            rms_norm_eps=rms_norm_eps,
-            attention_bias=attention_bias,
-            quant_config=quant_config,
-            prefix=add_prefix("self_attn", prefix),
-            alt_stream=alt_stream,
-        )
+
+        afd_perspective = get_afd_perspective()
+
+        if afd_perspective == AFDPerspective.AFD_PERSPECTIVE_FFN:
+            self.self_attn = AFDProxyAttention()
+        else:
+            self.self_attn = Qwen3MoeAttention(
+                hidden_size=self.hidden_size,
+                num_heads=config.num_attention_heads,
+                num_kv_heads=config.num_key_value_heads,
+                layer_id=layer_id,
+                rope_theta=rope_theta,
+                rope_scaling=rope_scaling,
+                max_position_embeddings=max_position_embeddings,
+                head_dim=head_dim,
+                rms_norm_eps=rms_norm_eps,
+                attention_bias=attention_bias,
+                quant_config=quant_config,
+                prefix=add_prefix("self_attn", prefix),
+                alt_stream=alt_stream,
+            )
 
         self.layer_id = layer_id
 
@@ -492,7 +505,9 @@ class Qwen3MoeDecoderLayer(nn.Module):
             is_previous_layer_sparse=is_previous_layer_sparse,
         )
 
-        if self.is_layer_sparse:
+        if afd_perspective == AFDPerspective.AFD_PERSPECTIVE_ATTN:
+            self.mlp = AFDProxyMLP()
+        elif self.is_layer_sparse:
             self.mlp = Qwen3MoeSparseMoeBlock(
                 layer_id=self.layer_id,
                 config=config,
@@ -518,13 +533,19 @@ class Qwen3MoeDecoderLayer(nn.Module):
             post_attention_layernorm=self.post_attention_layernorm,
         )
 
-    def forward(
+        if afd_perspective is not None:
+            self.layer_communicator = AFDCommunicator(
+                    layer_communicator = self.layer_communicator,
+                    perspective=afd_perspective,
+                    layer_id=layer_id)
+
+    def forward_afd_A(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    )-> Tuple[torch.Tensor, torch.Tensor]:
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
@@ -541,12 +562,58 @@ class Qwen3MoeDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
+        return hidden_states, residual
+
+    def forward_afd_F(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: torch.Tensor,
+    )-> Tuple[torch.Tensor, torch.Tensor]:
+
         hidden_states = self.mlp(hidden_states, forward_batch)
 
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
 
+        return hidden_states, residual
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        logger.warning(f"============= 0 Qwen3MoeDecoderLayer forward : {get_attention_tp_rank()}, {hidden_states}")
+        hidden_states, residual = self.layer_communicator.prepare_attn(
+            hidden_states, residual, forward_batch
+        )
+
+        logger.warning(f"============= 1 Qwen3MoeDecoderLayer forward : {get_attention_tp_rank()}, {hidden_states}")
+        if hidden_states.shape[0] != 0:
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+
+        logger.warning(f"============= 2 Qwen3MoeDecoderLayer forward : {get_attention_tp_rank()}, {self.layer_communicator}")
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states, residual, forward_batch
+        )
+
+        logger.warning(f"============= 3 Qwen3MoeDecoderLayer forward : {get_attention_tp_rank()}, {self.mlp}")
+        hidden_states = self.mlp(hidden_states, forward_batch)
+
+        logger.warning(f"============= 4 Qwen3MoeDecoderLayer forward : {get_attention_tp_rank()}, {hidden_states}")
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
+
+        logger.warning(f"============= 5 Qwen3MoeDecoderLayer forward : {get_attention_tp_rank()}, {hidden_states}")
         return hidden_states, residual
 
     def op_comm_prepare_attn(
@@ -662,6 +729,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        logger.warning(f"cll---- tp_rank:{get_attention_tp_rank()} mode:{forward_batch.forward_mode} batch id:{forward_batch.forward_mode.batch_id} child:{None if not forward_batch.afd_children else len(forward_batch.afd_children)}")
         hidden_states = self.model(
             input_ids,
             positions,
@@ -751,21 +819,30 @@ class Qwen3MoeForCausalLM(nn.Module):
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
 
-        expert_params_mapping = get_moe_impl_class().make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
-        )
+        afd_perspective = get_afd_perspective()
+
+        if afd_perspective == AFDPerspective.AFD_PERSPECTIVE_FFN:
+            stacked_params_mapping = []
+        else:
+            stacked_params_mapping = [
+                # (param_name, shard_name, shard_id)
+                ("qkv_proj", "q_proj", "q"),
+                ("qkv_proj", "k_proj", "k"),
+                ("qkv_proj", "v_proj", "v"),
+                ("gate_up_proj", "gate_proj", 0),
+                ("gate_up_proj", "up_proj", 1),
+            ]
+
+        if afd_perspective == AFDPerspective.AFD_PERSPECTIVE_ATTN:
+            expert_params_mapping = []
+        else:
+            expert_params_mapping = get_moe_impl_class().make_expert_params_mapping(
+                ckpt_gate_proj_name="gate_proj",
+                ckpt_down_proj_name="down_proj",
+                ckpt_up_proj_name="up_proj",
+                num_experts=self.config.num_experts,
+            )
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:

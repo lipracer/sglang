@@ -64,7 +64,25 @@ if TYPE_CHECKING:
 _is_npu = is_npu()
 
 
-class ForwardMode(IntEnum):
+class ForwardModeExtend:
+    batch_prefill_id: int = 0
+    batch_decode_id: int = 0
+
+    def increase_id(self, other):
+        if self.is_prefill():
+            self.batch_prefill_id = other.batch_prefill_id + 1
+        elif self.is_decode():
+            self.batch_decode_id = other.batch_decode_id + 1
+    
+    def set_id(self, other):
+        self.batch_prefill_id = other.batch_prefill_id
+        self.batch_decode_id = other.batch_decode_id
+
+    @property
+    def batch_id(self):
+        return [self.batch_prefill_id, self.batch_decode_id]
+
+class ForwardMode(ForwardModeExtend, IntEnum):
     # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
     # It is also called "prefill" in common terminology.
     EXTEND = auto()
@@ -73,7 +91,7 @@ class ForwardMode(IntEnum):
     # Contains both EXTEND and DECODE when doing chunked prefill.
     MIXED = auto()
     # No sequence to forward. For data parallel attention, some workers will be IDLE if no sequence are allocated.
-    IDLE = auto()
+    IDLE = auto() 
 
     # Used in speculative decoding: verify a batch in the target model.
     TARGET_VERIFY = auto()
@@ -297,6 +315,14 @@ class ForwardBatch:
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
+    # For afd overlap
+    afd_split_seq_index: Optional[List[int]] = None    #len = m-1
+    afd_parent_token_range: Optional[Tuple[int, int]] = None
+    afd_children: Optional[List[ForwardBatch]] = None
+
+    # For AF disaggregation
+    can_run_afd_overlap: bool = None
+
     @classmethod
     def init_new(
         cls,
@@ -304,6 +330,7 @@ class ForwardBatch:
         model_runner: ModelRunner,
     ):
         from sglang.srt.two_batch_overlap import TboForwardBatchPreparer
+        from sglang.srt.two_batch_overlap import AfdForwardBatchPreparer
 
         ret = cls(
             forward_mode=batch.forward_mode,
@@ -440,6 +467,10 @@ class ForwardBatch:
         # Init lora information
         if model_runner.server_args.enable_lora:
             model_runner.lora_manager.prepare_lora_batch(ret)
+
+        ret.afd_split_seq_index = ret.tbo_split_seq_index
+        AfdForwardBatchPreparer.prepare(ret)
+        ret.tbo_split_seq_index = None
 
         TboForwardBatchPreparer.prepare(
             ret, is_draft_worker=model_runner.is_draft_worker

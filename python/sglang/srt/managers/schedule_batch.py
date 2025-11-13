@@ -108,6 +108,8 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "weight_loader_disable_mmap",
     "enable_triton_kernel_moe",
     "enable_multimodal",
+    "afd_perspective",
+    "afd_mirco_batch",
 ]
 
 # Put some global args for easy access
@@ -677,6 +679,11 @@ class Req:
         return all_ids[self.surr_offset :], self.read_offset - self.surr_offset
 
     def check_finished(self):
+        from sglang.srt.layers.afd import afd_is_ffn
+        if afd_is_ffn():
+            # always skip for ffn
+            return
+
         if self.finished():
             return
 
@@ -1695,6 +1702,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             attention_backend_str = global_server_args_dict["prefill_attention_backend"]
         # Create seq_lens_cpu when needed
+        from sglang.srt.layers.afd import get_afd_perspective
         if (
             attention_backend_str == "fa3"
             or (
@@ -1705,6 +1713,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             or attention_backend_str == "cutlass_mla"
             or attention_backend_str == "ascend"
             or global_server_args_dict["enable_two_batch_overlap"]
+            or get_afd_perspective() is not None
         ):
             seq_lens_cpu = (
                 seq_lens_cpu_cache

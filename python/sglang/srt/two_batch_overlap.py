@@ -29,6 +29,8 @@ _tbo_debug = get_bool_env_var("SGLANG_TBO_DEBUG")
 
 logger = logging.getLogger(__name__)
 
+from sglang.srt.layers.afd import afd_is_ffn, get_afd_mirco_batch, get_afd_perspective
+from sglang.srt.layers.afd_type import AFDPerspective
 
 # -------------------------------- Compute Basic Info ---------------------------------------
 
@@ -618,6 +620,360 @@ def _compute_extend_num_tokens(input_ids, forward_mode: ForwardMode):
     elif forward_mode.is_extend():
         return input_ids.shape[0]
     raise NotImplementedError
+
+class AfdForwardBatchPreparer:
+    """
+    AFD-NOTE: This should be merged into Tbo. Only m == 2 or 3 support now.
+    """
+    @classmethod
+    def prepare(cls, batch: ForwardBatch):
+        # cant be used together with tbo
+
+        if (batch.afd_split_seq_index is None or
+            get_afd_mirco_batch() is None or
+            get_afd_mirco_batch() == 1
+        ):
+            return
+
+        afd_children_num_token_non_padded = (
+            cls.compute_afd_children_num_token_non_padded(batch)
+        )
+        cls.prepare_raw(
+            batch, afd_children_num_token_non_padded=afd_children_num_token_non_padded
+        )
+
+        batch.can_run_afd_overlap = True
+
+    @classmethod
+    def prepare_raw(
+        cls, batch: ForwardBatch, afd_children_num_token_non_padded: torch.Tensor
+    ):
+        from sglang.srt.layers.attention.tbo_backend import AfdAttnBackend
+
+        afd_split_token_index = cls._compute_split_token_index(batch)
+
+        if _tbo_debug:
+            logger.info(
+                f"afdForwardBatchPreparer.prepare "
+                f"afd_split_seq_index={batch.afd_split_seq_index} "
+                f"afd_split_token_index={afd_split_token_index} "
+                f"extend_seq_lens={batch.extend_seq_lens_cpu} "
+                f"bs={batch.batch_size} "
+                f"forward_mode={batch.forward_mode}"
+            )
+
+        m = get_afd_mirco_batch()
+        if m == 2:
+            # skip this, we dont prepare child attn backend
+            assert isinstance(batch.attn_backend, AfdAttnBackend)
+            attn_backend_child_a, attn_backend_child_b = batch.attn_backend.children
+
+            [out_num_token_non_padded_a, out_num_token_non_padded_b] = (
+                afd_children_num_token_non_padded
+            )
+
+            child_a = cls.filter_batch(
+                batch,
+                start_token_index=0,
+                end_token_index=afd_split_token_index[0],
+                start_seq_index=0,
+                end_seq_index=batch.afd_split_seq_index[0],
+                output_attn_backend=attn_backend_child_a,
+                out_num_token_non_padded=out_num_token_non_padded_a,
+            )
+            child_b = cls.filter_batch(
+                batch,
+                start_token_index=afd_split_token_index[0],
+                end_token_index=batch.input_ids.shape[0],
+                start_seq_index=batch.afd_split_seq_index[0],
+                end_seq_index=batch.batch_size,
+                output_attn_backend=attn_backend_child_b,
+                out_num_token_non_padded=out_num_token_non_padded_b,
+            )
+
+            assert batch.afd_children is None
+            batch.afd_children = [child_a, child_b]
+        elif m == 3:
+            assert isinstance(batch.attn_backend, AfdAttnBackend)
+            attn_backend_child_a, attn_backend_child_b, attn_backend_child_c = batch.attn_backend.children
+
+            [out_num_token_non_padded_a, out_num_token_non_padded_b, out_num_token_non_padded_c] = (
+                afd_children_num_token_non_padded
+            )
+
+            child_a = cls.filter_batch(
+                batch,
+                start_token_index=0,
+                end_token_index=afd_split_token_index[0],
+                start_seq_index=0,
+                end_seq_index=batch.afd_split_seq_index[0],
+                output_attn_backend=attn_backend_child_a,
+                out_num_token_non_padded=out_num_token_non_padded_a,
+            )
+            child_b = cls.filter_batch(
+                batch,
+                start_token_index=afd_split_token_index[0],
+                end_token_index=afd_split_token_index[1],
+                start_seq_index=batch.afd_split_seq_index[0],
+                end_seq_index=batch.afd_split_seq_index[1],
+                output_attn_backend=attn_backend_child_b,
+                out_num_token_non_padded=out_num_token_non_padded_b,
+            )
+            child_c = cls.filter_batch(
+                batch,
+                start_token_index=afd_split_token_index[1],
+                end_token_index=batch.input_ids.shape[0],
+                start_seq_index=batch.afd_split_seq_index[1],
+                end_seq_index=batch.batch_size,
+                output_attn_backend=attn_backend_child_c,
+                out_num_token_non_padded=out_num_token_non_padded_c,
+            )
+
+            assert batch.afd_children is None
+            batch.afd_children = [child_a, child_b, child_c]
+        else:
+            raise NotImplementedError
+
+    @classmethod
+    def filter_batch(
+        cls,
+        batch: ForwardBatch,
+        *,
+        start_token_index: int,
+        end_token_index: int,
+        start_seq_index: int,
+        end_seq_index: int,
+        output_attn_backend: AttentionBackend,
+        out_num_token_non_padded: torch.Tensor,
+    ):
+        assert (
+            end_token_index >= start_token_index
+        ), f"{end_token_index=}, {start_token_index=}, batch={batch}"
+        num_tokens = batch.input_ids.shape[0]
+        num_seqs = batch.batch_size
+
+        output_dict = dict()
+
+        # some key should be skipped in ffn (for kvcache)
+        invalid_key_ffn = [
+            "out_cache_loc",
+            "req_pool_indices",
+        ]
+        if afd_is_ffn():
+            for key in invalid_key_ffn:
+                output_dict[key] = None
+
+        def ffn_skip(key):
+            if afd_is_ffn() and key in invalid_key_ffn:
+                return True
+            return False
+
+        for key in [
+            "input_ids",
+            "positions",
+            "out_cache_loc",
+        ]:
+            if ffn_skip(key):
+                continue
+
+            old_value = getattr(batch, key)
+
+            assert (
+                old_value.shape[0] == num_tokens
+            ), f"{key=} {old_value=} {num_tokens=} {batch=}"
+            output_dict[key] = old_value[start_token_index:end_token_index]
+
+        for key in [
+            "req_pool_indices",
+            "seq_lens",
+            "seq_lens_cpu",
+            "extend_seq_lens",
+            "extend_prefix_lens",
+            "extend_start_loc",
+            "extend_prefix_lens_cpu",
+            "extend_seq_lens_cpu",
+            "extend_logprob_start_lens_cpu",
+            "lora_paths",
+        ]:
+            if ffn_skip(key):
+                continue
+
+            old_value = getattr(batch, key)
+            if old_value is None:
+                continue
+            elif batch.forward_mode.is_target_verify() and (
+                key == "extend_seq_lens"
+                or key == "extend_prefix_lens"
+                or key == "extend_start_loc"
+                or key == "extend_prefix_lens_cpu"
+                or key == "extend_seq_lens_cpu"
+                or key == "extend_logprob_start_lens_cpu"
+            ):
+                output_dict[key] = None
+                continue
+            assert (
+                len(old_value) == num_seqs
+            ), f"{key=} {old_value=} {num_seqs=} {batch=}"
+            output_dict[key] = old_value[start_seq_index:end_seq_index]
+
+        spec_info = getattr(batch, "spec_info")
+        output_spec_info = split_spec_info(
+            spec_info=spec_info,
+            start_token_index=start_token_index,
+            end_token_index=end_token_index,
+            start_seq_index=start_seq_index,
+            end_seq_index=end_seq_index,
+        )
+        output_dict["spec_info"] = output_spec_info
+        for key in [
+            "forward_mode",
+            "is_extend_in_batch",
+            "return_logprob",
+            "req_to_token_pool",
+            "token_to_kv_pool",
+            "can_run_dp_cuda_graph",
+            "global_forward_mode",
+            "spec_algorithm",
+            "capture_hidden_mode",
+            "padded_static_len",
+            "mrope_positions",  # only used by qwen2-vl, thus not care
+            "split_index",  # for split prefill
+        ]:
+            if ffn_skip(key):
+                continue
+
+            output_dict[key] = getattr(batch, key)
+        if not batch.forward_mode.is_target_verify():
+            assert (
+                _compute_extend_num_tokens(batch.input_ids, batch.forward_mode)
+                == batch.extend_num_tokens
+            ), f"{batch=}"
+        extend_num_tokens = _compute_extend_num_tokens(
+            output_dict["input_ids"], output_dict["forward_mode"]
+        )
+
+        # TODO improve, e.g. unify w/ `init_raw`
+        if (
+            global_server_args_dict["moe_dense_tp_size"] == 1
+            and batch.gathered_buffer is not None
+        ):
+            sum_len = end_token_index - start_token_index
+            gathered_buffer = torch.zeros(
+                (sum_len, batch.gathered_buffer.shape[1]),
+                dtype=batch.gathered_buffer.dtype,
+                device=batch.gathered_buffer.device,
+            )
+        else:
+            gathered_buffer = None
+
+        output_dict.update(
+            dict(
+                batch_size=end_seq_index - start_seq_index,
+                seq_lens_sum=(
+                    output_dict["seq_lens_cpu"].sum()
+                    if "seq_lens_cpu" in output_dict
+                    else None
+                ),
+                extend_num_tokens=extend_num_tokens,
+                attn_backend=output_attn_backend,
+                num_token_non_padded=out_num_token_non_padded,
+                tbo_split_seq_index=None,
+                tbo_parent_token_range=None,
+                tbo_children=None,
+                afd_split_seq_index=None,
+                afd_parent_token_range=(start_token_index, end_token_index),
+                afd_children=None,
+                global_num_tokens_gpu=None,
+                global_num_tokens_cpu=None,
+                dp_padding_mode=None,
+                gathered_buffer=gathered_buffer,
+                global_num_tokens_for_logprob_gpu=None,
+                global_num_tokens_for_logprob_cpu=None,
+                sampling_info=None,
+                # For logits and logprobs post processing, thus we do not care
+                temp_scaled_logprobs=False,
+                temperature=None,
+                top_p_normalized_logprobs=False,
+                top_p=None,
+                mm_inputs=None,
+                top_logprobs_nums=None,
+                token_ids_logprobs=None,
+            )
+        )
+
+        errors = []
+        for field in dataclasses.fields(ForwardBatch):
+            if getattr(batch, field.name) is not None and field.name not in output_dict:
+                errors.append(
+                    f"Field {field.name} has value, but is not yet supported (value={getattr(batch, field.name)} batch={batch})"
+                )
+        if len(errors) > 0:
+            raise Exception(f"{len(errors)} errors happen:\n" + "\n\n".join(errors))
+
+        return ForwardBatch(**output_dict)
+
+    @classmethod
+    def compute_afd_children_num_token_non_padded(cls, batch: ForwardBatch):
+        return cls.compute_afd_children_num_token_non_padded_raw(
+            afd_split_token_index=cls._compute_split_token_index(batch),
+            num_token_non_padded=len(batch.input_ids),
+        )
+
+    @classmethod
+    def compute_afd_children_num_token_non_padded_raw(
+        cls, afd_split_token_index: List[int], num_token_non_padded: int
+    ):
+        # TODO we may make padding on both sub-batches to make it slightly more balanced
+        m = get_afd_mirco_batch()
+        if m == 2:
+            value_a = min(afd_split_token_index[0], num_token_non_padded)
+            value_b = max(0, num_token_non_padded - afd_split_token_index[0])
+            return torch.tensor([value_a, value_b], dtype=torch.int32).to(
+                device=global_server_args_dict["device"], non_blocking=True
+            )
+        elif m == 3:
+            value_a = afd_split_token_index[0]
+            value_b = afd_split_token_index[1] - afd_split_token_index[0]
+            value_c = num_token_non_padded - afd_split_token_index[1]
+            return torch.tensor([value_a, value_b, value_c], dtype=torch.int32).to(
+                device=global_server_args_dict["device"], non_blocking=True
+            )
+        else:
+            raise NotImplementedError
+
+
+    @classmethod
+    def _compute_split_token_index(cls, batch: ForwardBatch):
+        token_num_per_seq = get_token_num_per_seq(
+            forward_mode=batch.forward_mode, spec_info=batch.spec_info
+        )
+        m = get_afd_mirco_batch()
+        if m == 2:
+            return [compute_split_token_index(
+                split_seq_index=batch.afd_split_seq_index[0],
+                forward_mode=batch.forward_mode,
+                extend_seq_lens=batch.extend_seq_lens_cpu,
+                token_num_per_seq=token_num_per_seq,
+            )]
+        elif m == 3:
+            forward_mode = batch.forward_mode
+            split_seq_index = batch.afd_split_seq_index
+            if forward_mode == ForwardMode.EXTEND:
+                extend_seq_lens = batch.extend_seq_lens_cpu
+                return [
+                    sum(extend_seq_lens[:split_seq_index[0]]),
+                    sum(extend_seq_lens[:split_seq_index[1]])
+                ]
+            elif forward_mode.is_decode():
+                assert token_num_per_seq is not None
+                return [
+                    split_seq_index[0] * token_num_per_seq,
+                    split_seq_index[1] * token_num_per_seq
+                ]
+            else:
+                raise NotImplementedError
+        else:
+            raise NotImplementedError
 
 
 # -------------------------------- Execution ---------------------------------------

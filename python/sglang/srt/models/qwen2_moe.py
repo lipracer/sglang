@@ -72,6 +72,8 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.utils import add_prefix, make_layers
 
+from sglang.srt.layers.afd import model_forward_afd
+
 logger = logging.getLogger(__name__)
 
 
@@ -108,9 +110,12 @@ class Qwen2MoeMLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
+        logger.warning(f"=============0 Qwen2MoeMLP forward : {get_attention_tp_rank()}, {x}")
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
+        logger.warning(f"=============1 Qwen2MoeMLP forward : {get_attention_tp_rank()}, {x}")
         x, _ = self.down_proj(x)
+        logger.warning(f"=============2 Qwen2MoeMLP forward : {get_attention_tp_rank()}, {x}")
         return x
 
 
@@ -452,6 +457,7 @@ class Qwen2MoeModel(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        logger.warning(f"============= 0 Qwen2MoeModel forward : {get_attention_tp_rank()}, {forward_batch.batch_size} ")
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -463,8 +469,20 @@ class Qwen2MoeModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        logger.warning(f"============= 1 Qwen2MoeModel forward : {get_attention_tp_rank()}, {hidden_states}")
         aux_hidden_states = []
-        if forward_batch.can_run_tbo:
+        if forward_batch.can_run_afd_overlap:
+            logger.warning(f"============= 1.1 Qwen2MoeModel forward : {get_attention_tp_rank()}, {hidden_states}")
+            hidden_states, residual = model_forward_afd(
+                layers=self.layers,
+                positions=positions,
+                forward_batch=forward_batch,
+                hidden_states=hidden_states,
+                residual=residual,
+                input_data_scatter_mode=ScatterMode.model_input_output(),
+            )
+        elif forward_batch.can_run_tbo:
+            logger.warning(f"============= 1.2 Qwen2MoeModel forward : {get_attention_tp_rank()}, {hidden_states}")
             hidden_states, residual = model_forward_maybe_tbo(
                 layers=self.layers,
                 enable_tbo=True,
@@ -475,7 +493,9 @@ class Qwen2MoeModel(nn.Module):
                 residual=residual,
             )
         else:
+            logger.warning(f"============= 1.3 Qwen2MoeModel forward : {get_attention_tp_rank()}, {self.start_layer}, {self.end_layer}")
             for i in range(self.start_layer, self.end_layer):
+                logger.warning(f"============= 1.3.1 Qwen2MoeModel forward : {get_attention_tp_rank()}, {self.layers_to_capture}")
                 if i in self.layers_to_capture:
                     aux_hidden_states.append(
                         hidden_states + residual
@@ -483,10 +503,12 @@ class Qwen2MoeModel(nn.Module):
                         else hidden_states
                     )
                 with get_global_expert_distribution_recorder().with_current_layer(i):
+                    logger.warning(f"============= 1.3.2 Qwen2MoeModel forward : {get_attention_tp_rank()}, {self.layers[i]}")
                     layer = self.layers[i]
                     hidden_states, residual = layer(
                         positions, hidden_states, forward_batch, residual
                     )
+        logger.warning(f"============= 2 Qwen2MoeModel forward : {get_attention_tp_rank()}, {hidden_states}")
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
@@ -504,6 +526,7 @@ class Qwen2MoeModel(nn.Module):
         if len(aux_hidden_states) == 0:
             return hidden_states
 
+        logger.warning(f"============= 3 Qwen2MoeModel forward : {get_attention_tp_rank()}, {hidden_states}")
         return hidden_states, aux_hidden_states
 
 

@@ -237,6 +237,9 @@ class MHATokenToKVPool(KVCache):
             ):
                 # [size, head_num, head_dim] for each layer
                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                logger.warning(f"========== self.size:{self.size} self.page_size:{self.page_size}"
+                               f"\nself.head_num:{self.head_num} self.head_dim:{self.head_dim}"
+                               f"\nself.store_dtype:{self.store_dtype} self.layer_num:{self.layer_num}")
                 self.k_buffer = [
                     torch.zeros(
                         (self.size + self.page_size, self.head_num, self.head_dim),
@@ -280,6 +283,7 @@ class MHATokenToKVPool(KVCache):
         v_size_bytes = 0
         for v_cache in self.v_buffer:
             v_size_bytes += np.prod(v_cache.shape) * v_cache.dtype.itemsize
+        logger.warning(f"c=======================k_size_bytes:{k_size_bytes} v_size_bytes:{v_size_bytes} {k_cache.shape}")
         return k_size_bytes, v_size_bytes
 
     # for disagg

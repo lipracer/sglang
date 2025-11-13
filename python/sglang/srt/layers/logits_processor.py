@@ -272,6 +272,8 @@ class LogitsProcessor(nn.Module):
                     + logits_metadata.extend_seq_lens
                     - 1
                 )
+            logger.warning(f"cll ------------------------ LogitsProcessor: {last_index} {logits_metadata.padded_static_len}")
+
             pruned_states = hidden_states[last_index]
             if aux_hidden_states is not None:
                 aux_pruned_states = [hidden[last_index] for hidden in aux_hidden_states]

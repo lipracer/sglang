@@ -703,6 +703,7 @@ class SchedulerOutputProcessorMixin:
             )
 
     def stream_output_embedding(self: Scheduler, reqs: List[Req]):
+        logger.warning(f"cll -------------------------- stream_output_embedding")
         rids = []
         finished_reasons: List[BaseFinishReason] = []
 

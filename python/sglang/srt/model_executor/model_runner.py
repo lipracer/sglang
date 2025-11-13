@@ -53,7 +53,7 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
-from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+from sglang.srt.layers.attention.tbo_backend import TboAttnBackend, AfdAttnBackend
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     get_attention_tp_size,
@@ -120,6 +120,15 @@ from sglang.srt.utils import (
     set_cpu_offload_max_bytes,
     set_cuda_arch,
 )
+
+from sglang.srt.layers.afd import get_afd_perspective, get_afd_mirco_batch, afd_is_ffn
+
+class AfdFfnMHATokenToKVPool(MHATokenToKVPool):
+    def _create_buffers(self):
+        pass
+
+    def get_kv_size_bytes(self):
+        return 32289374208, 32289374208
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -1131,11 +1140,14 @@ class ModelRunner:
                 )
             self.max_total_num_tokens = min(self.max_total_num_tokens, max_total_tokens)
 
-        self.max_total_num_tokens = (
-            self.max_total_num_tokens
-            // self.server_args.page_size
-            * self.server_args.page_size
-        )
+        if afd_is_ffn():
+            self.max_total_num_tokens = 656928
+        else:
+            self.max_total_num_tokens = (
+                self.max_total_num_tokens
+                // self.server_args.page_size
+                * self.server_args.page_size
+            )
         # create token size for hybrid cache
         if self.is_hybrid:
             self.set_num_token_hybrid()
@@ -1160,6 +1172,7 @@ class ModelRunner:
                     pre_alloc_size=pre_alloc_size,
                 )
             else:
+                logger.warning(f"cll --- init ReqToTokenPool")
                 self.req_to_token_pool = ReqToTokenPool(
                     size=max_num_reqs,
                     max_context_len=self.model_config.context_len + 4,
@@ -1237,7 +1250,14 @@ class ModelRunner:
                     device=self.device,
                 )
             else:
-                self.token_to_kv_pool = MHATokenToKVPool(
+                logger.warning(f"cll-------------- init MHATokenToKVPool self.max_total_num_tokens:{self.max_total_num_tokens}")
+                pool_cls = None
+                if afd_is_ffn():
+                    pool_cls = AfdFfnMHATokenToKVPool
+                else:
+                    pool_cls = MHATokenToKVPool
+                
+                self.token_to_kv_pool = pool_cls(
                     self.max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
@@ -1263,6 +1283,7 @@ class ModelRunner:
                         kvcache=self.token_to_kv_pool,
                     )
                 else:
+                    logger.warning(f"cll-------------- init TokenToKVPoolAllocator")
                     self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
                         self.max_total_num_tokens,
                         dtype=self.kv_cache_dtype,
@@ -1279,6 +1300,7 @@ class ModelRunner:
                         kvcache=self.token_to_kv_pool,
                     )
                 else:
+                    logger.warning(f"cll-------------- init PagedTokenToKVPoolAllocator")
                     self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
                         self.max_total_num_tokens,
                         page_size=self.page_size,
@@ -1307,6 +1329,9 @@ class ModelRunner:
         """Init attention kernel backend."""
         if self.server_args.enable_two_batch_overlap and not self.is_draft_worker:
             self.attn_backend = TboAttnBackend.init_new(self._get_attention_backend)
+        elif get_afd_perspective() is not None:
+            m = get_afd_mirco_batch()
+            self.attn_backend = AfdAttnBackend.init_new(self._get_attention_backend, m = m)
         else:
             self.attn_backend = self._get_attention_backend()
 
