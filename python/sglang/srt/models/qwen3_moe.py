@@ -66,11 +66,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_non_idle_and_non_empty,
 )
-from sglang.srt.layers.afd_type import AFDPerspective
-from sglang.srt.layers.afd import (
-    AFDCommunicator, AFDProxyAttention, AFDProxyMLP, afd_is_attn, afd_is_ffn,
-    get_afd_perspective,
-)
+from sglang.srt.layers.afd import AFDCommunicatorATTN, AFDCommunicatorFFN, afd_is_attn, afd_is_ffn
 
 Qwen3MoeConfig = None
 
@@ -463,29 +459,34 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
         rms_norm_eps = config.rms_norm_eps
         attention_bias = config.attention_bias
+        dual_chunk_attention_config = getattr(
+            config, "dual_chunk_attention_config", None
+        )
+        Qwen3MoeAttentionClass = Qwen3MoeAttention
+        Qwen3MoeSparseMoeBlockClass, Qwen3MoeMLPClass = Qwen3MoeSparseMoeBlock, Qwen3MoeMLP
+        if afd_is_attn():
+            self.afd_communicator = AFDCommunicatorATTN()
+            Qwen3MoeSparseMoeBlockClass, Qwen3MoeMLPClass = nn.Identity, nn.Identity
+        elif afd_is_ffn():
+            self.afd_communicator = AFDCommunicatorFFN()
+            Qwen3MoeAttentionClass = nn.Identity
 
-        if afd_is_ffn():
-            self.self_attn = AFDProxyAttention()
-        else:
-            dual_chunk_attention_config = getattr(
-                config, "dual_chunk_attention_config", None
-            )
-            self.self_attn = Qwen3MoeAttention(
-                hidden_size=self.hidden_size,
-                num_heads=config.num_attention_heads,
-                num_kv_heads=config.num_key_value_heads,
-                layer_id=layer_id,
-                rope_theta=rope_theta,
-                rope_scaling=rope_scaling,
-                max_position_embeddings=max_position_embeddings,
-                head_dim=head_dim,
-                rms_norm_eps=rms_norm_eps,
-                attention_bias=attention_bias,
-                quant_config=quant_config,
-                prefix=add_prefix("self_attn", prefix),
-                dual_chunk_attention_config=dual_chunk_attention_config,
-                alt_stream=alt_stream,
-            )
+        self.self_attn = Qwen3MoeAttentionClass(
+            hidden_size=self.hidden_size,
+            num_heads=config.num_attention_heads,
+            num_kv_heads=config.num_key_value_heads,
+            layer_id=layer_id,
+            rope_theta=rope_theta,
+            rope_scaling=rope_scaling,
+            max_position_embeddings=max_position_embeddings,
+            head_dim=head_dim,
+            rms_norm_eps=rms_norm_eps,
+            attention_bias=attention_bias,
+            quant_config=quant_config,
+            prefix=add_prefix("self_attn", prefix),
+            dual_chunk_attention_config=dual_chunk_attention_config,
+            alt_stream=alt_stream,
+        )
 
         self.layer_id = layer_id
 
@@ -503,17 +504,15 @@ class Qwen3MoeDecoderLayer(nn.Module):
             is_previous_layer_sparse=is_previous_layer_sparse,
         )
 
-        if afd_is_attn():
-            self.mlp = AFDProxyMLP()
-        elif self.is_layer_sparse:
-            self.mlp = Qwen3MoeSparseMoeBlock(
+        if self.is_layer_sparse:
+            self.mlp = Qwen3MoeSparseMoeBlockClass(
                 layer_id=self.layer_id,
                 config=config,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
         else:
-            self.mlp = Qwen3MoeMLP(
+            self.mlp = Qwen3MoeMLPClass(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
@@ -533,15 +532,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
             is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
         )
 
-        afd_perspective = get_afd_perspective()
-        if afd_perspective is not None:
-            self.layer_communicator = AFDCommunicator(
-                layer_communicator = self.layer_communicator,
-                perspective=afd_perspective,
-                layer_id=layer_id,
-                is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
-            )
-
     def forward_afd_A(
         self,
         positions: torch.Tensor,
@@ -550,20 +540,22 @@ class Qwen3MoeDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     )-> Tuple[torch.Tensor, torch.Tensor]:
 
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
-        )
+        if hidden_states.size(0) != 0:
+            hidden_states, residual = self.layer_communicator.prepare_attn(
+                hidden_states, residual, forward_batch
+            )
 
-        if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+            hidden_states, residual = self.layer_communicator.prepare_mlp(
+                hidden_states, residual, forward_batch
+            )
+
+        hidden_states = self.afd_communicator.attn_transmit(hidden_states)
 
         return hidden_states, residual
 
@@ -574,11 +566,14 @@ class Qwen3MoeDecoderLayer(nn.Module):
         residual: torch.Tensor,
     )-> Tuple[torch.Tensor, torch.Tensor]:
 
-        hidden_states = self.mlp(hidden_states, forward_batch)
+        if hidden_states.size(0) != 0:
+            hidden_states = self.mlp(hidden_states, forward_batch)
 
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
-        )
+            hidden_states, residual = self.layer_communicator.postprocess_layer(
+                hidden_states, residual, forward_batch
+            )
+
+        hidden_states = self.afd_communicator.ffn_transmit(hidden_states)
 
         return hidden_states, residual
 
@@ -609,7 +604,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                 forward_batch
             )
-        ) if not afd_is_ffn() else False
+        )
 
         # For DP with padding, reduce scatter can be used instead of all-reduce.
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
@@ -749,7 +744,7 @@ class Qwen3MoeForCausalLM(nn.Module):
             input_embeds,
             pp_proxy_tensors=pp_proxy_tensors,
         )
-        if hidden_states.shape[0] == 0:
+        if hidden_states.size(0) == 0:
             return hidden_states
 
         aux_hidden_states = None
@@ -833,28 +828,21 @@ class Qwen3MoeForCausalLM(nn.Module):
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ] if not afd_is_ffn() else []
 
-        if afd_is_ffn():
-            stacked_params_mapping = []
-        else:
-            stacked_params_mapping = [
-                # (param_name, shard_name, shard_id)
-                ("qkv_proj", "q_proj", "q"),
-                ("qkv_proj", "k_proj", "k"),
-                ("qkv_proj", "v_proj", "v"),
-                ("gate_up_proj", "gate_proj", 0),
-                ("gate_up_proj", "up_proj", 1),
-            ]
-
-        if afd_is_attn():
-            expert_params_mapping = []
-        else:
-            expert_params_mapping = FusedMoE.make_expert_params_mapping(
-                ckpt_gate_proj_name="gate_proj",
-                ckpt_down_proj_name="down_proj",
-                ckpt_up_proj_name="up_proj",
-                num_experts=self.config.num_experts,
-            )
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.num_experts,
+        ) if not afd_is_attn() else []
 
         # Cache params_dict to avoid repeated expensive traversal of model parameters
         if not hasattr(self, "_cached_params_dict"):

@@ -67,7 +67,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
 
-from sglang.srt.layers.afd import afd_is_ffn, model_forward_afd
+from sglang.srt.layers.afd import model_forward_afd
 
 logger = logging.getLogger(__name__)
 
@@ -501,10 +501,11 @@ class Qwen2MoeModel(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         if self.pp_group.is_first_rank:
-            if afd_is_ffn():
-                input_embeds = torch.empty(0)
             if input_embeds is None:
-                hidden_states = self.embed_tokens(input_ids)
+                if input_ids.size(0) == 0:
+                    hidden_states = torch.empty(0, dtype=torch.bfloat16, device=input_ids.device)
+                else:
+                    hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
             residual = None
@@ -512,7 +513,6 @@ class Qwen2MoeModel(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
-
         aux_hidden_states = []
         if forward_batch.can_run_afd_overlap:
             hidden_states, residual = model_forward_afd(

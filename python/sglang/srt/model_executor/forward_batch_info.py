@@ -1051,6 +1051,8 @@ def compute_position_kernel(
 def compute_position_torch(
     extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor
 ):
+    if extend_prefix_lens.shape[0] == 0:
+        return torch.empty(0, dtype=torch.int64, device=extend_prefix_lens.device), torch.empty(0, dtype=torch.int32, device=extend_prefix_lens.device)
     positions = torch.cat(
         [
             torch.arange(
@@ -1065,7 +1067,7 @@ def compute_position_torch(
     return positions.to(torch.int64), extend_start_loc
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+# @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def clamp_position(seq_lens):
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
 

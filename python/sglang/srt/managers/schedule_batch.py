@@ -2017,3 +2017,9 @@ def get_last_loc_triton(
         BLOCK_SIZE,
     )
     return result
+
+
+@dataclasses.dataclass
+class AFDBatch:
+    batch_size: int
+    forward_mode: ForwardMode

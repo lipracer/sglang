@@ -43,7 +43,6 @@ _tbo_debug = get_bool_env_var("SGLANG_TBO_DEBUG")
 logger = logging.getLogger(__name__)
 
 from sglang.srt.layers.afd import afd_is_ffn, get_afd_mirco_batch
-from sglang.srt.layers.afd_type import AFDPerspective
 
 # -------------------------------- Compute Basic Info ---------------------------------------
 
@@ -936,6 +935,9 @@ class AfdForwardBatchPreparer:
                 continue
 
             old_value = getattr(batch, key)
+            if old_value is None:
+                output_dict[key] = None
+                continue
 
             assert (
                 old_value.shape[0] == num_tokens
@@ -959,6 +961,7 @@ class AfdForwardBatchPreparer:
 
             old_value = getattr(batch, key)
             if old_value is None:
+                output_dict[key] = None
                 continue
             elif batch.forward_mode.is_target_verify() and (
                 key == "extend_seq_lens"

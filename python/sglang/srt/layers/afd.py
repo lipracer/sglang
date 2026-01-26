@@ -86,20 +86,23 @@ class FifoTensorCommunicator(ABC):
     def send_tensor(self, x: torch.Tensor):
         raise NotImplementedError
 
+    @abstractmethod
+    def init(self, dp_rank, dp_size, tp_rank, tp_size):
+        raise NotImplementedError
+
 class ZMQSimpleTensorCommunicator(FifoTensorCommunicator):
-    def __init__(self, afd_perspective: AFDPerspective):
+    def __init__(self):
         super().__init__()
         self.zmq_context = zmq.Context()
 
-        self.start_lport = (
-            self.get_ffn_port() if afd_perspective == AFDPerspective.AFD_PERSPECTIVE_ATTN
-            else self.get_attn_port()
-        )
+        self.start_lport = self.get_ffn_port() if afd_is_attn() else self.get_attn_port()
+        self.start_dport = self.get_attn_port() if afd_is_attn() else self.get_ffn_port()
 
-        self.start_dport = (
-            self.get_attn_port() if afd_perspective == AFDPerspective.AFD_PERSPECTIVE_ATTN
-            else self.get_ffn_port()
-        )
+    def init(self, dp_rank, dp_size, tp_rank, tp_size):
+        self.dp_rank = dp_rank
+        self.dp_size = dp_size
+        self.tp_rank = tp_rank
+        self.tp_size = tp_size
 
     def get_ffn_port(self) -> int:
         return 40000
@@ -152,48 +155,47 @@ class StepMeshTensorCache(object):
         self.h = None
 
 def stepmesh_scheduler():
+    import setproctitle
+    setproctitle.setproctitle("stepmesh_scheduler")
+
     os.environ['DMLC_ROLE'] = 'scheduler'
 
-    print("StepMesh scheduler: DMLC_PS_ROOT_URI=%s" % os.environ["DMLC_NODE_HOST"])
+    logger.info("StepMesh scheduler: DMLC_PS_ROOT_URI=%s" % os.environ["DMLC_NODE_HOST"])
     import fserver_lib as f
 
     f.init()
-    print("StepMesh scheduler init done.")
+    logger.info("StepMesh scheduler init done.")
 
     while True:
         time.sleep(10000)
 
-    f.stop()
 
 class StepMeshTensorCommunicator(FifoTensorCommunicator):
-    def __init__(self, afd_perspective: AFDPerspective):
-        self.perspective = afd_perspective
-
+    def __init__(self):
         super().__init__()
+
+        self.key = 0
+        self.comm_ids = []
+        self.waits = []
+        self.free_tensors = {}
+        self.register_buf = {}
+        self.buf_size_history = []
+
+    def init(self, dp_rank, dp_size, tp_rank, tp_size):
+        self.dp_rank = dp_rank
+        self.dp_size = dp_size
+        self.tp_rank = tp_rank
+        self.tp_size = tp_size
 
         import fserver_lib as f
 
         self.start_stepmesh_scheduler()
         if afd_is_attn():
             time.sleep(10) # wait scheduler
-
         logger.info("%s init..." % os.environ['DMLC_ROLE'])
         f.init()
         logger.info("%s init done." % os.environ['DMLC_ROLE'])
-
-        self.worker_num = int(os.environ['DMLC_NUM_WORKER'])
-
-        self.key = 0
-        self.gpu = torch.cuda.current_device()
-        self.tensor_shape = None
-
         self.f = f
-
-        self.comm_ids = []
-        self.waits = []
-        self.free_tensors = {}
-        self.register_buf = {}
-        self.buf_size_history = []
 
     def env_def(self, env, v):
         if os.environ.get(env) == None:
@@ -210,7 +212,7 @@ class StepMeshTensorCommunicator(FifoTensorCommunicator):
         interfaces = psutil.net_if_addrs()
 
         if interface_name not in interfaces:
-            print("Invalid DMLC_INTERFACE %s" % interface_name)
+            logger.info("Invalid DMLC_INTERFACE %s" % interface_name)
             return
 
         for addr in interfaces[interface_name]:
@@ -221,15 +223,14 @@ class StepMeshTensorCommunicator(FifoTensorCommunicator):
     def start_stepmesh_scheduler(self):
         self.get_node_ip()
 
-        gpu = '%s' % torch.cuda.current_device()
-
-        self.env_def('DMLC_NODE_RANK',    '0')
+        self.env_def('DMLC_NODE_RANK',    str(self.dp_rank if self.dp_rank else 0))
         self.env_def('DMLC_NUM_SERVER',   '1')
         self.env_def('DMLC_NUM_WORKER',   '1')
         self.env_def('DMLC_GROUP_SIZE',   '1')
         self.env_def('DMLC_PS_ROOT_PORT', '8123')
         self.env_def('DMLC_ENABLE_RDMA',  'ibverbs')
-        self.env_def('STEPMESH_GPU',      gpu)
+        self.env_def('STEPMESH_GPU',      str(torch.cuda.current_device()))
+        self.env_def('DMLC_INSTANCE_ID',  str(self.tp_rank if self.tp_rank else 0))
 
         if afd_is_attn():
             os.environ['DMLC_ROLE'] = 'worker'
@@ -258,6 +259,9 @@ class StepMeshTensorCommunicator(FifoTensorCommunicator):
         p.start()
 
     def attn_send(self, x):
+        if x.size(0) == 0:
+            x = torch.empty([1], dtype=x.dtype, device=x.device)
+
         free = self.free_tensors.get(x.shape, [])
         self.free_tensors[x.shape] = free
 
@@ -268,13 +272,13 @@ class StepMeshTensorCommunicator(FifoTensorCommunicator):
             self.key += 2
             t = StepMeshTensorCache(x, self.key)
 
-            if (len(self.buf_size_history) > 6):
+            if (len(self.buf_size_history) > 3):
                 oldest_size = self.buf_size_history.pop(0)
                 _tensors = self.free_tensors.get(oldest_size)
                 if (len(_tensors) > 1):
-                    _tensors.pop()
+                    del _tensors[-1]
                 else:
-                    self.free_tensors.pop(oldest_size)
+                    del self.free_tensors[oldest_size]
             self.buf_size_history.append(x.shape)
 
         t.h = self.f.push_pull(
@@ -287,9 +291,14 @@ class StepMeshTensorCommunicator(FifoTensorCommunicator):
 
     def attn_recv(self):
         t = self.waits.pop(0)
-        self.f.wait(t.h)
+        self.f.wait(t.h, timeout_ms=100000)
 
-        self.free_tensors[t.push_tensor.shape].append(t)
+        free = self.free_tensors.get(t.push_tensor.shape, [])
+        self.free_tensors[t.push_tensor.shape] = free
+        free.append(t)
+
+        if t.pull_tensor.ndim == 1:
+            return torch.empty(0, dtype=t.pull_tensor.dtype, device=t.pull_tensor.device)
 
         return t.pull_tensor
 
@@ -304,18 +313,23 @@ class StepMeshTensorCommunicator(FifoTensorCommunicator):
             t = torch.empty_like(x)
             t.copy_(x)
 
-            if (len(self.buf_size_history) > 6):
+            if (len(self.buf_size_history) > 3):
                 oldest_size = self.buf_size_history.pop(0)
                 _tensors = self.free_tensors.get(oldest_size)
                 if (len(_tensors) > 1):
-                    _tensors.pop()
+                    del _tensors[-1]
                 else:
-                    self.free_tensors.pop(oldest_size)
+                    del self.free_tensors[oldest_size]
             self.buf_size_history.append(x.shape)
 
         c = self.comm_ids.pop(0)
-
-        self.f.respond([t], c, True)
+        for _id, comm_id in enumerate(c[0]):
+            _need_event = (_id == 0)
+            idx_range = c[1][_id]
+            _res_tensor = t[idx_range[0]:idx_range[1]]
+            if _res_tensor.size(0) == 0:
+                _res_tensor = torch.empty([1], dtype=_res_tensor.dtype, device=x.device)
+            self.f.respond([_res_tensor], comm_id, _need_event)
 
         free.append(t)
 
@@ -326,12 +340,30 @@ class StepMeshTensorCommunicator(FifoTensorCommunicator):
         #     [comm_id, push_tensor_list, key_list],
         #     [comm_id, push_tensor_list, key_list],
         # ]
-        assert len(batches) == 1, "just handle for one worker"
+        # assert len(batches) == 1, "just handle for one worker"
 
-        x = batches[0][1][0]
-        self.comm_ids.append(batches[0][0])
+        _comm_ids = []
+        _idx_ranges = []
+        _tensor_list = []
+        _begin_idx = 0
 
-        return x
+        for batch in batches:
+            if batch[1][0].ndim == 1:
+                _length = 0
+            else:
+                _length = batch[1][0].size(0)
+                _tensor_list.append(batch[1][0])
+            _end_idx = _begin_idx + _length
+            _idx_ranges.append([_begin_idx, _end_idx])
+            _comm_ids.append(batch[0])
+            _begin_idx = _end_idx
+        self.comm_ids.append([_comm_ids, _idx_ranges])
+        if len(_tensor_list) == 0:
+            return torch.empty(0, dtype=batches[0][1][0].dtype, device=batches[0][1][0].device)
+        elif len(_tensor_list) == 1:
+            return _tensor_list[0]
+        else:
+            return torch.cat(_tensor_list, dim=0)
 
     def recv_tensor(self) -> torch.Tensor:
         if afd_is_attn():
@@ -347,16 +379,15 @@ class StepMeshTensorCommunicator(FifoTensorCommunicator):
 
 @cache
 def get_tensor_communicator() -> FifoTensorCommunicator:
-    afd_perspective = get_afd_perspective()
-    if afd_perspective is not None:
-        if os.environ.get("DMLC_INTERFACE"):
-            return StepMeshTensorCommunicator(afd_perspective)
-        else:
-            return ZMQSimpleTensorCommunicator(afd_perspective)
-    return None
+    if os.environ.get("DMLC_INTERFACE"):
+        return StepMeshTensorCommunicator()
+    else:
+        return ZMQSimpleTensorCommunicator()
 
 def get_afd_mirco_batch() -> int:
     afd_mirco_batch = global_server_args_dict.get("afd_mirco_batch")
+    if afd_mirco_batch is None:
+        raise ValueError("afd_mirco_batch is not set")
     return afd_mirco_batch
 
 def get_afd_perspective() -> Optional[AFDPerspective]:
@@ -364,10 +395,10 @@ def get_afd_perspective() -> Optional[AFDPerspective]:
     return afd_perspective
 
 def afd_is_ffn():
-    return get_afd_perspective() == AFDPerspective.AFD_PERSPECTIVE_FFN
+    return get_afd_perspective() == AFDPerspective.FFN
 
 def afd_is_attn():
-    return get_afd_perspective() == AFDPerspective.AFD_PERSPECTIVE_ATTN
+    return get_afd_perspective() == AFDPerspective.ATTN
 
 def model_forward_afd_split_inputs(
     layers,
@@ -534,9 +565,11 @@ def model_forward_afd(
         *((res["hidden_states"], res["residual"]) for res in results)
     )
 
+    all_residual = [res for res in all_residual if res is not None]
+
     return (
         torch.cat(all_hidden_states, dim=0),
-        torch.cat(all_residual, dim=0) if afd_is_attn() else None,
+        torch.cat(all_residual, dim=0) if afd_is_attn() and (len(all_residual) > 0) else None,
     )
 
 
@@ -633,94 +666,38 @@ def deepseek_v2_forward_afd(
         torch.cat(all_residual, dim=0) if afd_is_attn() else None,
     )
 
-class AFDCommunicator(LayerCommunicator):
-    def __init__(self, layer_communicator: LayerCommunicator, perspective: AFDPerspective, layer_id: int, is_last_layer: int):
-        super().__init__(
-            layer_scatter_modes=layer_communicator.layer_scatter_modes,
-            input_layernorm=layer_communicator.input_layernorm,
-            post_attention_layernorm=layer_communicator.post_attention_layernorm,
-            allow_reduce_scatter=True,
-            is_last_layer=layer_communicator.is_last_layer,
-        )
-        self.perspective = perspective
-        self.layer_communicator = layer_communicator
-        self.layer_id = layer_id
-        # init attr from layer_communicator
-        for attr in dir(layer_communicator):
-            if not attr.startswith("__") and not attr in dir(self):
-                setattr(self, attr, getattr(layer_communicator, attr))
-        self.empty_tensor = torch.empty(0)
+class AFDCommunicator:
+    def __init__(self):
+        self.empty_tensor = torch.empty(0, dtype=global_server_args_dict.get("dtype"), device=global_server_args_dict.get("device"))
 
-    def prepare_attn(
-        self,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        forward_batch: ForwardBatch,
-        qaunt_format: str = "",
-    ):
-        # just pass through
-        if afd_is_ffn():
-            return hidden_states, residual
+    @abstractmethod
+    def attn_transmit(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
 
-        return self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch, qaunt_format
-        )
+    @abstractmethod
+    def ffn_transmit(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
 
-    def prepare_mlp(
-        self,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ):
-        def _prepare_mlp_attn():
-            nonlocal hidden_states, residual
-            hidden_states, residual = self.layer_communicator.prepare_mlp(hidden_states, residual, forward_batch)
-            get_tensor_communicator().send_tensor(hidden_states)
-            return self.empty_tensor, residual
 
-        def _prepare_mlp_ffn():
-            hidden_states = get_tensor_communicator().recv_tensor()
-            return hidden_states, residual
+class AFDCommunicatorATTN(AFDCommunicator):
+    def __init__(self):
+        super().__init__()
 
-        return _prepare_mlp_attn() if afd_is_attn() else _prepare_mlp_ffn()
+    def attn_transmit(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        get_tensor_communicator().send_tensor(hidden_states)
+        return self.empty_tensor
 
-    def postprocess_layer(
-        self,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ):
-        def _postprocess_layer_attn():
-            nonlocal residual
-            hidden_states = get_tensor_communicator().recv_tensor()
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
-            return hidden_states, residual
+    def ffn_transmit(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return get_tensor_communicator().recv_tensor()
 
-        def _postprocess_layer_ffn():
-            get_tensor_communicator().send_tensor(hidden_states)
-            return self.empty_tensor, residual
 
-        return _postprocess_layer_attn() if afd_is_attn() else _postprocess_layer_ffn()
+class AFDCommunicatorFFN(AFDCommunicator):
+    def __init__(self):
+        super().__init__()
 
-class AFDProxyAttention(nn.Module):
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        *args,
-        **kwargs,
-    ) -> torch.Tensor:
-        return hidden_states
+    def attn_transmit(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return get_tensor_communicator().recv_tensor()
 
-class AFDProxyMLP(nn.Module):
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        forward_batch: Optional[ForwardBatch] = None,
-        *args,
-        **kwargs,
-    ) -> torch.Tensor:
-        return hidden_states
+    def ffn_transmit(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        get_tensor_communicator().send_tensor(hidden_states)
+        return self.empty_tensor

@@ -5,8 +5,7 @@ import torch
 from sglang.srt import two_batch_overlap
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-from sglang.srt.layers.afd import afd_is_ffn, get_afd_mirco_batch, get_afd_perspective                                  
-from sglang.srt.layers.afd_type import AFDPerspective
+from sglang.srt.layers.afd import afd_is_ffn                                  
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -187,6 +186,7 @@ class TboAttnBackend(AttentionBackend):
     def forward_decode(self, *args, **kwargs):
         return self.primary.forward_decode(*args, **kwargs)
 
+
 class AfdAttnBackend(AttentionBackend):
     def __init__(self, primary: AttentionBackend, children: List[AttentionBackend]):
         super().__init__()
@@ -215,6 +215,7 @@ class AfdAttnBackend(AttentionBackend):
 
     def forward_decode(self, *args, **kwargs):
         return self.primary.forward_decode(*args, **kwargs)
+
 
 def _init_forward_metadata_cuda_graph_split(
     fn_name: str,

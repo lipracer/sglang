@@ -18,8 +18,8 @@ from enum import Enum
 import argparse
 
 class AFDPerspective(Enum):
-    AFD_PERSPECTIVE_ATTN = "attn"
-    AFD_PERSPECTIVE_FFN = "ffn"
+    ATTN = "attn"
+    FFN = "ffn"
 
     def __str__(self):
         return self.value

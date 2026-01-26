@@ -112,6 +112,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
     Req,
     ScheduleBatch,
+    AFDBatch,
     global_server_args_dict,
 )
 from sglang.srt.managers.schedule_policy import (
@@ -528,19 +529,25 @@ class Scheduler(
         if get_bool_env_var("SGLANG_GC_LOG"):
             configure_gc_logger()
 
-        self.send_to_ffn, self.recv_from_attn = None, None
-        host = os.getenv("AFD_SCHED_HOST", "127.0.0.1")
-        port = get_int_env_var("AFD_SCHED_PORT", 65300)
-        afd_ipc_name = f"tcp://{host}:{port + dist.get_rank()}"
-        if afd_is_attn():
-            self.send_to_ffn = get_zmq_socket(
-                context, zmq.PUSH, afd_ipc_name, False
-            )
-        elif afd_is_ffn():
-            self.recv_from_attn = get_zmq_socket(
-                context, zmq.PULL, afd_ipc_name, True
-            )
-        get_tensor_communicator()
+        # Init Attn-FFN disaggregation
+        if get_afd_perspective() is not None:
+            self.send_to_ffn, self.recv_from_attn = None, None
+            host = os.getenv("AFD_SCHED_HOST", "127.0.0.1")
+            port = get_int_env_var("AFD_SCHED_PORT", 65300)
+            afd_ipc_name = f"tcp://{host}:{port + dist.get_rank()}"
+            if afd_is_attn():
+                self.send_to_ffn = get_zmq_socket(
+                    context, zmq.PUSH, afd_ipc_name, False
+                )
+                if self.dp_size > 1:
+                    self.link_to_dp0 = get_zmq_socket(
+                        context, zmq.DEALER, f"tcp://{host}:{port + 100 + dist.get_rank()}", self.dp_rank == 0
+                    )
+            elif afd_is_ffn():
+                self.recv_from_attn = get_zmq_socket(
+                    context, zmq.PULL, afd_ipc_name, True
+                )
+            get_tensor_communicator().init(self.dp_rank, self.dp_size, self.tp_rank, self.tp_size)
 
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
@@ -850,12 +857,9 @@ class Scheduler(
             '''
             batch.tbo_split_seq_index = None
             m = get_afd_mirco_batch()
-            if batch.batch_size() < m:
-                return
-
             forward_mode = batch.forward_mode
 
-            def _split_array_by_sum_m(arr: Sequence[int], m) -> int:
+            def _split_array_by_sum_m(arr: Sequence[int], m) -> List[int]:
                 if m == 2:
                     overall_sum = sum(arr)
                     left_sum = 0
@@ -897,6 +901,17 @@ class Scheduler(
                 raise NotImplementedError()
 
         logger.info("event_loop_afd: role={} m={}".format(get_afd_perspective(), get_afd_mirco_batch()))
+        fake_batch = ScheduleBatch(
+            reqs=[],
+            forward_mode=ForwardMode.DECODE,
+            seq_lens=torch.empty(0, dtype=torch.int64, device=self.req_to_token_pool.device),
+            extend_lens=[],
+            prefix_lens=[],
+            tbo_split_seq_index=[0] * (get_afd_mirco_batch() - 1),
+            input_ids=torch.empty(0, dtype=torch.int64, device=self.req_to_token_pool.device),
+            extend_num_tokens=0,
+            spec_algorithm=self.spec_algorithm,
+        )
 
         def _event_loop_attn():
             while True:
@@ -907,23 +922,34 @@ class Scheduler(
                 batch = self.get_next_batch_to_run()
                 self.cur_batch = batch
 
+                if self.dp_size > 1:
+                    if self.dp_rank == 0:
+                        _is_run = bool(batch)
+                        for _ in range(self.dp_size - 1):
+                            _is_run |= self.link_to_dp0.recv_pyobj()
+                        for _ in range(self.dp_size - 1):
+                            self.link_to_dp0.send_pyobj(_is_run)
+                    else:
+                        self.link_to_dp0.send_pyobj(bool(batch))
+                        _is_run = self.link_to_dp0.recv_pyobj()
+                    if not _is_run:
+                        time.sleep(0.001)
+                    if _is_run and not batch:
+                        batch = fake_batch
+                    
                 if batch:
                     prepare_overlap(batch)
 
-                    afd_batch = ScheduleBatch(
-                        reqs=[],
+                    afd_batch = AFDBatch(
+                        batch_size=batch.batch_size(),
                         forward_mode=batch.forward_mode,
-                        seq_lens=batch.seq_lens.cpu(),
-                        extend_lens=batch.extend_lens,
-                        prefix_lens=batch.prefix_lens,
-                        tbo_split_seq_index=batch.tbo_split_seq_index,
-                        input_ids=batch.input_ids.cpu(),
-                        extend_num_tokens=batch.extend_num_tokens,
                     )
-                    self.send_to_ffn.send_pyobj(afd_batch)
+                    if self.dp_rank in (0, -1, None):
+                        self.send_to_ffn.send_pyobj(afd_batch)
 
                     result = self.run_batch(batch)
-                    self.process_batch_result(batch, result)
+                    if result.next_token_ids is not None:
+                        self.process_batch_result(batch, result)
                 else:
                     # When the server is idle, do self-check and re-init some states
                     self.self_check_during_idle()
@@ -932,12 +958,8 @@ class Scheduler(
         
         def _event_loop_ffn():
             while True:
-                try:
-                    batch: ScheduleBatch = self.recv_from_attn.recv_pyobj(zmq.NOBLOCK)
-                except zmq.ZMQError:
-                    continue
-
-                self.run_batch(batch)
+                afd_batch: AFDBatch = self.recv_from_attn.recv_pyobj()
+                self.run_batch(fake_batch)
 
         if afd_is_attn():
             _event_loop_attn()

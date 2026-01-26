@@ -255,7 +255,7 @@ class TpModelWorker:
             if launch_done is not None:
                 launch_done.set()
 
-            if skip_sample or afd_is_ffn():
+            if skip_sample or afd_is_ffn() or model_worker_batch.input_ids.shape[0] == 0:
                 next_token_ids = None
             else:
                 next_token_ids = self.model_runner.sample(

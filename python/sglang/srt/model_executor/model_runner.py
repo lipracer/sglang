@@ -1819,7 +1819,7 @@ class ModelRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
-        if not skip_attn_backend_init:
+        if not skip_attn_backend_init and forward_batch.batch_size != 0:
             self.attn_backend.init_forward_metadata(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = {}

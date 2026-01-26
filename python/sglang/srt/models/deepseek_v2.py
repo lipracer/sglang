@@ -43,9 +43,8 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.afd import (
-    AFDCommunicator,
-    AFDProxyAttention,
-    AFDProxyMLP,
+    AFDCommunicatorATTN,
+    AFDCommunicatorFFN,
     afd_is_attn,
     afd_is_ffn,
     deepseek_v2_forward_afd,
@@ -1952,8 +1951,8 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         afd_perspective = get_afd_perspective()
 
-        if afd_perspective == AFDPerspective.AFD_PERSPECTIVE_FFN:
-            self.self_attn = AFDProxyAttention()
+        if afd_perspective == AFDPerspective.FFN:
+            self.self_attn = nn.Identity()
         else:
             self.self_attn = DeepseekV2AttentionMLA(
                 config=config,
@@ -1986,8 +1985,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             is_previous_layer_sparse=is_previous_layer_sparse,
         )
 
-        if afd_perspective == AFDPerspective.AFD_PERSPECTIVE_ATTN:
-            self.mlp = AFDProxyMLP()
+        if afd_perspective == AFDPerspective.ATTN:
+            self.mlp = nn.Identity()
         elif self.is_layer_sparse:
             self.mlp = DeepseekV2MoE(
                 config=config,
@@ -2028,12 +2027,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
         if afd_perspective is not None:
-            self.layer_communicator = AFDCommunicator(
-                layer_communicator=self.layer_communicator,
-                perspective=afd_perspective,
-                layer_id=layer_id,
-                is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
-            )
+            self.afd_communicator = AFDCommunicatorATTN() if afd_is_attn() else AFDCommunicatorFFN()
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
         return is_nextn or (
@@ -2089,6 +2083,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
+        hidden_states = self.afd_communicator.attn_transmit(hidden_states)
 
         return hidden_states, residual
 
@@ -2113,6 +2108,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
+        hidden_states = self.afd_communicator.ffn_transmit(hidden_states)
 
         return hidden_states, residual
 
@@ -2828,8 +2824,8 @@ class DeepseekV2ForCausalLM(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         afd_perspective = get_afd_perspective()
-        is_afd_ffn = afd_perspective == AFDPerspective.AFD_PERSPECTIVE_FFN
-        is_afd_attn = afd_perspective == AFDPerspective.AFD_PERSPECTIVE_ATTN
+        is_afd_ffn = afd_perspective == AFDPerspective.FFN
+        is_afd_attn = afd_perspective == AFDPerspective.ATTN
 
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
